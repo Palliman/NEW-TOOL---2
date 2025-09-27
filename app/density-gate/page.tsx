@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import DensityGateV2, { type DensityGateTargets, type DensityGateResult } from "./DensityGate_v2" // place your file next to this page
+import DensityGateV2, { type DensityGateTargets, type DensityGateResult } from "./DensityGate_v2"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -10,21 +10,114 @@ import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import JSZip from "jszip"
+import { DOMParser } from "xmldom"
 
-/**
- * DensityGate – Bulk Draft Uploader & Auto‑Fix Page (Standalone)
- * ---------------------------------------------------------------
- * Paste / upload 1–20 drafts (txt/markdown/html). Each draft is evaluated by DensityGateV2.
- * Drafts are bucketed into Passed / Needs Fixes. You can:
- *  - Save all passed drafts (zip)
- *  - Auto‑fix failing drafts via LLM (OpenAI or xAI Grok) using the audit hints as strict guidelines
- *  - Re‑run the gate until all pass, then save as a new set
- *
- * Notes
- *  - This page uses shadcn/ui for basic components. If you don't have shadcn installed,
- *    replace with your own UI or simple HTML elements.
- *  - Place your existing DensityGate_v2.tsx beside this file and update the import path above.
- */
+async function callLLM(
+  provider: "openai" | "xai",
+  apiKey: string,
+  system: string,
+  user: string,
+  attempt = 0,
+): Promise<string> {
+  if (!apiKey) throw new Error("Missing API key")
+  const maxAttempts = 5
+  const baseDelay = 800 // ms
+
+  const doFetch = async () => {
+    if (provider === "openai") {
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          temperature: 0.2,
+        }),
+      })
+      if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status })
+      const j = await r.json()
+      return j?.choices?.[0]?.message?.content ?? ""
+    } else {
+      const r = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "grok-2-latest",
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          temperature: 0.2,
+        }),
+      })
+      if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status })
+      const j = await r.json()
+      return j?.choices?.[0]?.message?.content ?? ""
+    }
+  }
+
+  try {
+    return await doFetch()
+  } catch (e: any) {
+    const status = e?.status || 0
+    if (attempt < maxAttempts - 1 && (status === 429 || status >= 500)) {
+      const jitter = Math.random() * 200
+      const delay = Math.min(8000, baseDelay * Math.pow(2, attempt)) + jitter
+      await new Promise((r) => setTimeout(r, delay))
+      return callLLM(provider, apiKey, system, user, attempt + 1)
+    }
+    throw e
+  }
+}
+
+function extractUrls(html: string): Set<string> {
+  const set = new Set<string>()
+  const doc = new DOMParser().parseFromString(html, "text/html")
+  doc.querySelectorAll("a[href]").forEach((a) => {
+    try {
+      set.add(new URL((a as HTMLAnchorElement).href).href)
+    } catch {}
+  })
+  return set
+}
+
+function stripNewUrls(originalHtml: string, newHtml: string, allowDomains: string[]): string {
+  const before = extractUrls(originalHtml)
+  const doc = new DOMParser().parseFromString(newHtml, "text/html")
+  doc.querySelectorAll("a[href]").forEach((a) => {
+    const href = (a as HTMLAnchorElement).href
+    let ok = before.has(href)
+    if (!ok) {
+      try {
+        const u = new URL(href)
+        ok = allowDomains.some((dom) => u.hostname === dom || u.hostname.endsWith(`.${dom}`))
+      } catch {}
+    }
+    if (!ok) {
+      const span = doc.createTextNode((a as HTMLAnchorElement).textContent || "")
+      a.replaceWith(span) // unwrap link, keep text
+    }
+  })
+  return doc.body.innerHTML
+}
+
+async function semaphore<T>(pool: number, tasks: (() => Promise<T>)[]): Promise<T[]> {
+  const results: T[] = []
+  let i = 0
+  const workers = Array(Math.max(1, pool))
+    .fill(0)
+    .map(async () => {
+      while (i < tasks.length) {
+        const cur = i++
+        results[cur] = await tasks[cur]()
+      }
+    })
+  await Promise.all(workers)
+  return results
+}
 
 // ---------- Types ----------
 export type Draft = {
@@ -102,136 +195,10 @@ function buildFixPrompt(d: Draft): { system: string; user: string } {
   return { system, user }
 }
 
-// ---------- LLM client (replace with your infra) ----------
-export type Provider = "openai" | "xai" // chatgpt / grok
-
-async function callLLMWithRetry(
-  provider: Provider,
-  apiKey: string,
-  system: string,
-  user: string,
-  maxRetries = 3,
-): Promise<string> {
-  let lastError: Error | null = null
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await callLLM(provider, apiKey, system, user)
-    } catch (error: any) {
-      lastError = error
-
-      // Check if it's a rate limit error (429)
-      if (error.message?.includes("429") || error.status === 429) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 30000) // Cap at 30 seconds
-        console.log(`[v0] Rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`)
-        await new Promise((resolve) => setTimeout(resolve, delay))
-        continue
-      }
-
-      // For non-rate-limit errors, throw immediately
-      throw error
-    }
-  }
-
-  throw lastError || new Error("Max retries exceeded")
-}
-
-async function callLLM(provider: Provider, apiKey: string, system: string, user: string): Promise<string> {
-  if (!apiKey) throw new Error("Missing API key")
-  if (provider === "openai") {
-    // Example for OpenAI Responses API (JS fetch). Adjust model + base as needed.
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini", // or other
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0.2,
-      }),
-    })
-
-    if (!r.ok) {
-      const errorText = await r.text()
-      throw new Error(`HTTP ${r.status}: ${errorText}`)
-    }
-
-    const j = await r.json()
-    const content = j?.choices?.[0]?.message?.content ?? ""
-    return content
-  }
-  if (provider === "xai") {
-    // Example for xAI Grok chat endpoint; adjust base/model per latest docs
-    const r = await fetch("https://api.x.ai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "grok-2-latest",
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        temperature: 0.2,
-      }),
-    })
-
-    if (!r.ok) {
-      const errorText = await r.text()
-      throw new Error(`HTTP ${r.status}: ${errorText}`)
-    }
-
-    const j = await r.json()
-    const content = j?.choices?.[0]?.message?.content ?? ""
-    return content
-  }
-  throw new Error("Unsupported provider")
-}
-
-async function processQueue<T>(
-  items: T[],
-  processor: (item: T) => Promise<void>,
-  concurrency = 3,
-  onProgress?: (completed: number, total: number, current?: T) => void,
-): Promise<void> {
-  const queue = [...items]
-  const inProgress = new Set<Promise<void>>()
-  let completed = 0
-
-  while (queue.length > 0 || inProgress.size > 0) {
-    // Start new tasks up to concurrency limit
-    while (queue.length > 0 && inProgress.size < concurrency) {
-      const item = queue.shift()!
-      const task = processor(item)
-        .then(() => {
-          completed++
-          onProgress?.(completed, items.length)
-        })
-        .catch((error) => {
-          console.error(`[v0] Error processing item:`, error)
-          completed++
-          onProgress?.(completed, items.length)
-        })
-        .finally(() => {
-          inProgress.delete(task)
-        })
-
-      inProgress.add(task)
-      onProgress?.(completed, items.length, item)
-    }
-
-    // Wait for at least one task to complete
-    if (inProgress.size > 0) {
-      await Promise.race(inProgress)
-    }
-  }
-}
-
 // ---------- Main Page ----------
 export default function DensityGateStandalonePage() {
   const [drafts, setDrafts] = useState<Draft[]>([])
-  const [provider, setProvider] = useState<Provider>("openai")
+  const [provider, setProvider] = useState<"openai" | "xai">("openai")
   const [apiKey, setApiKey] = useState<string>("")
   const [targets, setTargets] = useState<Partial<DensityGateTargets>>({})
   const [busy, setBusy] = useState(false)
@@ -243,11 +210,14 @@ export default function DensityGateStandalonePage() {
   const [concurrency, setConcurrency] = useState(3)
   const [mounted, setMounted] = useState(false)
 
+  const [brandTokens, setBrandTokens] = useState<string>("PacketDrip, BitCans, Drip Demons")
+  const [allowDomains, setAllowDomains] = useState<string>("yourdomain.com")
+
   useEffect(() => {
     setMounted(true)
 
     if (typeof window !== "undefined") {
-      const savedProvider = localStorage.getItem("dg_provider") as Provider
+      const savedProvider = localStorage.getItem("dg_provider") as "openai" | "xai"
       const savedApiKey = localStorage.getItem("dg_apiKey")
 
       if (savedProvider) {
@@ -328,7 +298,13 @@ export default function DensityGateStandalonePage() {
   // Fix a single draft via provider
   const fixOne = async (d: Draft) => {
     const { system, user } = buildFixPrompt(d)
-    const html = await callLLMWithRetry(provider, apiKey, system, user)
+    let html = await callLLM(provider, apiKey, system, user)
+    const allow = allowDomains
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    html = stripNewUrls(d.html, html, allow)
+
     setDrafts((list) =>
       list.map((x) =>
         x.id === d.id ? { ...x, fixedHtml: html, html, history: [...x.history, { step: "fix", at: Date.now() }] } : x,
@@ -347,26 +323,20 @@ export default function DensityGateStandalonePage() {
 
         console.log(`[v0] Starting pass ${pass}/${maxPasses} with ${needFix.length} drafts`)
 
-        // Process drafts with concurrency control
-        await processQueue(
-          needFix,
-          async (d) => {
-            try {
-              await fixOne(d)
-            } catch (error) {
+        const tasks = needFix.map(
+          (d) => () =>
+            fixOne(d).catch((error) => {
               console.error(`[v0] Failed to fix draft ${d.name}:`, error)
               // Continue processing other drafts even if one fails
-            }
-          },
-          concurrency,
-          (completed, total, current) => {
-            setQueueProgress({
-              completed,
-              total,
-              current: current?.name,
-            })
-          },
+            }),
         )
+
+        setQueueProgress({ completed: 0, total: needFix.length })
+
+        // Process with semaphore
+        await semaphore(concurrency, tasks)
+
+        setQueueProgress({ completed: needFix.length, total: needFix.length })
 
         if (!autoLoop) break // stop after one pass if toggled off
 
@@ -402,7 +372,7 @@ export default function DensityGateStandalonePage() {
         <div className="flex items-center gap-3">
           <select
             value={provider}
-            onChange={(e) => setProvider(e.target.value as Provider)}
+            onChange={(e) => setProvider(e.target.value as "openai" | "xai")}
             className="border rounded px-2 py-1 bg-background"
           >
             <option value="openai">OpenAI</option>
@@ -468,6 +438,27 @@ export default function DensityGateStandalonePage() {
                 placeholder="55"
                 onChange={(e) => setTargets((t) => ({ ...t, fleschMin: +e.target.value || undefined }))}
               />
+            </div>
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-4">
+            <div>
+              <Label>Brand Tokens (required in content)</Label>
+              <Input
+                value={brandTokens}
+                onChange={(e) => setBrandTokens(e.target.value)}
+                placeholder="PacketDrip, BitCans, Drip Demons"
+              />
+              <p className="text-xs opacity-70 mt-1">Comma-separated brand terms that must appear</p>
+            </div>
+            <div>
+              <Label>Allowed Domains (for links)</Label>
+              <Input
+                value={allowDomains}
+                onChange={(e) => setAllowDomains(e.target.value)}
+                placeholder="yourdomain.com, example.com"
+              />
+              <p className="text-xs opacity-70 mt-1">AI-added links to other domains will be stripped</p>
             </div>
           </div>
 
@@ -597,7 +588,13 @@ export default function DensityGateStandalonePage() {
                       title={d.meta.title}
                       metaDescription={d.meta.description}
                       h1={d.meta.h1}
-                      targets={targets}
+                      targets={{
+                        ...targets,
+                        brandTokens: brandTokens
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      }}
                       onEvaluate={(res) => onEvaluate(d.id, res)}
                     />
 
@@ -650,7 +647,13 @@ export default function DensityGateStandalonePage() {
                     title={d.meta.title}
                     metaDescription={d.meta.description}
                     h1={d.meta.h1}
-                    targets={targets}
+                    targets={{
+                      ...targets,
+                      brandTokens: brandTokens
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean),
+                    }}
                     onEvaluate={(res) => onEvaluate(d.id, res)}
                   />
                 </CardContent>
@@ -732,7 +735,13 @@ export default function DensityGateStandalonePage() {
                     title={d.meta.title}
                     metaDescription={d.meta.description}
                     h1={d.meta.h1}
-                    targets={targets}
+                    targets={{
+                      ...targets,
+                      brandTokens: brandTokens
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean),
+                    }}
                     onEvaluate={(res) => onEvaluate(d.id, res)}
                   />
                 </CardContent>

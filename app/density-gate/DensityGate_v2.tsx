@@ -14,6 +14,7 @@ export interface DensityGateTargets {
   fleschMin?: number
   secondaryMin?: number
   secondaryMax?: number
+  brandTokens?: string[] // Required brand tokens that must appear in content
 }
 
 export interface DensityGateCheck {
@@ -88,6 +89,18 @@ function calculateFleschScore(text: string): number {
   const avgSyllablesPerWord = syllables / words
 
   return 206.835 - 1.015 * avgWordsPerSentence - 84.6 * avgSyllablesPerWord
+}
+
+function validateBrandTokens(text: string, brandTokens: string[]): { pass: boolean; missing: string[] } {
+  if (!brandTokens || brandTokens.length === 0) return { pass: true, missing: [] }
+
+  const lowerText = text.toLowerCase()
+  const missing = brandTokens.filter((token) => !lowerText.includes(token.toLowerCase()))
+
+  return {
+    pass: missing.length === 0,
+    missing,
+  }
 }
 
 export default function DensityGateV2({
@@ -219,6 +232,16 @@ export default function DensityGateV2({
         pass: h1ContainsPrimary,
         target: "Required",
         hint: !h1ContainsPrimary ? "Include primary keyword in H1 tag" : undefined,
+      })
+    }
+
+    if (targets.brandTokens && targets.brandTokens.length > 0) {
+      const brandValidation = validateBrandTokens(plainText, targets.brandTokens)
+      checks.push({
+        label: "Brand Tokens",
+        pass: brandValidation.pass,
+        target: "All required",
+        hint: !brandValidation.pass ? `Missing brand tokens: ${brandValidation.missing.join(", ")}` : undefined,
       })
     }
 

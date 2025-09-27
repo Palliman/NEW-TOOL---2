@@ -60,6 +60,7 @@
     "tailwind-merge": "^2.5.5",
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^0.9.9",
+    "xmldom": "latest",
     "zod": "3.25.67"
   },
   "devDependencies": {
